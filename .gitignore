@@ -1,0 +1,8 @@
+.DS_Store
+.env
+data/
+bin/
+frontend/node_modules/
+frontend/dist/
+coverage.out
+*.test

@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS audit_events;
+DROP TABLE IF EXISTS evaluation_results;
+DROP TABLE IF EXISTS evaluation_jobs;
+ALTER TABLE IF EXISTS selections DROP CONSTRAINT IF EXISTS selections_current_submission_fk;
+DROP TABLE IF EXISTS submissions;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS selections;
+DROP TABLE IF EXISTS tasks;
+DROP TABLE IF EXISTS campaigns;
+DROP TABLE IF EXISTS plugin_versions;
+DROP TABLE IF EXISTS sessions;
+DROP TABLE IF EXISTS users;
+DROP TABLE IF EXISTS schema_migrations;

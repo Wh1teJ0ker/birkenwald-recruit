@@ -1,0 +1,13 @@
+body { margin: 0; background: #f3f6fb; }
+.site-header { background: #172b50; color: #fff; padding: 18px max(24px, calc((100vw - 1120px) / 2)); }
+.site-header h1 { color: #fff; margin: 0; font-size: 23px; }
+.site-header small { color: #d1dbec; }
+.page { max-width: 1120px; margin: 24px auto; padding: 0 20px 50px; }
+.auth-grid, .admin-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 20px; }
+.task-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 16px; }
+.section-card { margin-bottom: 20px; }
+.muted { color: #64748b; }
+.spaced { margin-top: 16px; }
+.file-links a { margin-right: 12px; }
+.header-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
+@media (max-width: 600px) { .site-header { padding: 16px 20px; } .page { padding: 0 12px 40px; } }
