@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS app_settings;
+ALTER TABLE users DROP COLUMN IF EXISTS disabled;

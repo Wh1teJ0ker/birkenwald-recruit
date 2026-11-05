@@ -224,11 +224,12 @@ func (s *Server) submit(c *gin.Context) {
 	defer tx.Rollback(c.Request.Context())
 	var taskID, pluginID int64
 	var deadline, closes, now time.Time
+	var taskStatus, campaignStatus string
 	var config json.RawMessage
-	err = tx.QueryRow(c.Request.Context(), `SELECT sel.task_id,t.plugin_version_id,t.plugin_config,t.deadline_at,c.closes_at,now()
+	err = tx.QueryRow(c.Request.Context(), `SELECT sel.task_id,t.plugin_version_id,t.plugin_config,t.status,t.deadline_at,c.status,c.closes_at,now()
         FROM selections sel JOIN tasks t ON t.id=sel.task_id JOIN campaigns c ON c.id=sel.campaign_id
         WHERE sel.id=$1 AND sel.student_id=$2 FOR UPDATE OF sel FOR SHARE OF t,c`, id, currentUser(c).ID).
-		Scan(&taskID, &pluginID, &config, &deadline, &closes, &now)
+		Scan(&taskID, &pluginID, &config, &taskStatus, &deadline, &campaignStatus, &closes, &now)
 	if errors.Is(err, pgx.ErrNoRows) {
 		fail(c, 404, "selection not found")
 		return
@@ -246,6 +247,10 @@ func (s *Server) submit(c *gin.Context) {
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		fail(c, 500, "submission failed")
+		return
+	}
+	if taskStatus != "published" || campaignStatus != "open" {
+		fail(c, 409, "submissions are closed")
 		return
 	}
 	if !now.Before(deadline) || !now.Before(closes) {

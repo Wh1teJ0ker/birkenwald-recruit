@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -39,21 +41,27 @@ func TestValidateResult(t *testing.T) {
 	}
 }
 
-func TestLimitedBufferCapsOutput(t *testing.T) {
-	b := &limitedBuffer{limit: 4}
-	if n, err := b.Write([]byte("123456")); n != 6 || err != nil || b.String() != "1234" {
-		t.Fatalf("unexpected bounded write: n=%d err=%v value=%q", n, err, b.String())
+func TestRunGoPluginExample(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Go plugins are only supported on Linux")
 	}
-	if n, err := b.Write([]byte("789")); n != 3 || err != nil || b.String() != "1234" {
-		t.Fatalf("unexpected second write: n=%d err=%v value=%q", n, err, b.String())
+	root, err := filepath.Abs("../..")
+	if err != nil {
+		t.Fatal(err)
 	}
-}
+	pluginPath := filepath.Join(t.TempDir(), "example.so")
+	args := []string{"build", "-buildmode=plugin", "-o", pluginPath}
+	if raceEnabled {
+		args = append(args, "-race")
+	}
+	args = append(args, "./plugins/example")
+	build := exec.Command("go", args...)
+	build.Dir = root
+	build.Env = append(os.Environ(), "CGO_ENABLED=1")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build example plugin: %v\n%s", err, output)
+	}
 
-func TestRunDockerExamplePlugin(t *testing.T) {
-	image := os.Getenv("TEST_DOCKER_PLUGIN_IMAGE")
-	if image == "" {
-		t.Skip("set TEST_DOCKER_PLUGIN_IMAGE after building plugins/example image")
-	}
 	var buf bytes.Buffer
 	zw := zip.NewWriter(&buf)
 	for _, name := range []string{"README.md", "main.go"} {
@@ -68,15 +76,17 @@ func TestRunDockerExamplePlugin(t *testing.T) {
 	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
-	path := filepath.Join(t.TempDir(), "submission.zip")
-	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
+	submissionPath := filepath.Join(t.TempDir(), "submission.zip")
+	if err := os.WriteFile(submissionPath, buf.Bytes(), 0600); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	w := &Worker{}
-	got, err := w.RunDocker(ctx, Job{ID: 1, SubmissionID: 2, TaskID: 3, Image: image, PackagePath: path,
-		Config: json.RawMessage(`{"required_files":["README.md","main.go"]}`)})
+	got, err := w.RunGoPlugin(ctx, Job{
+		ID: 1, SubmissionID: 2, TaskID: 3, LibraryPath: pluginPath, PackagePath: submissionPath,
+		Config: json.RawMessage(`{"required_files":["README.md","main.go"]}`),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,12 +8,14 @@ import (
 	"log/slog"
 	"math"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"plugin"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wh1teJ0ker/birkenwald-recruit/internal/platform"
+	"github.com/Wh1teJ0ker/birkenwald-recruit/pluginapi"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -24,17 +25,13 @@ type Job struct {
 	SubmissionID int64
 	Attempt      int32
 	LeaseToken   string
-	Image        string
+	LibraryPath  string
 	PackagePath  string
 	TaskID       int64
 	Config       json.RawMessage
 }
 
-type Result struct {
-	ProtocolVersion string          `json:"protocol_version"`
-	Score           float64         `json:"score"`
-	Details         json.RawMessage `json:"details"`
-}
+type Result = pluginapi.Result
 
 type Runner func(context.Context, Job) (Result, error)
 
@@ -42,11 +39,16 @@ type Worker struct {
 	DB     *pgxpool.Pool
 	Config platform.Config
 	Runner Runner
+
+	// A timed-out Go plugin cannot be killed. Fail further jobs for that path
+	// until the worker is restarted instead of calling into a potentially
+	// still-running library concurrently.
+	timedOut sync.Map
 }
 
 func (w *Worker) Run(ctx context.Context) error {
 	if w.Runner == nil {
-		w.Runner = w.RunDocker
+		w.Runner = w.RunGoPlugin
 	}
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -68,7 +70,7 @@ func (w *Worker) Run(ctx context.Context) error {
 
 func (w *Worker) RunOnce(ctx context.Context) (bool, error) {
 	if w.Runner == nil {
-		w.Runner = w.RunDocker
+		w.Runner = w.RunGoPlugin
 	}
 	job, err := w.claim(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -127,11 +129,11 @@ func (w *Worker) claim(ctx context.Context) (Job, error) {
 		return job, err
 	}
 	var key string
-	err = w.DB.QueryRow(ctx, `SELECT pv.image_ref,f.object_key,sel.task_id,j.plugin_config_snapshot
+	err = w.DB.QueryRow(ctx, `SELECT pv.library_path,f.object_key,sel.task_id,j.plugin_config_snapshot
         FROM evaluation_jobs j JOIN plugin_versions pv ON pv.id=j.plugin_version_id
         JOIN submissions sub ON sub.id=j.submission_id JOIN files f ON f.id=sub.package_file_id
         JOIN selections sel ON sel.id=sub.selection_id WHERE j.id=$1`, job.ID).
-		Scan(&job.Image, &key, &job.TaskID, &job.Config)
+		Scan(&job.LibraryPath, &key, &job.TaskID, &job.Config)
 	if err != nil {
 		return job, err
 	}
@@ -208,58 +210,57 @@ func (w *Worker) finish(ctx context.Context, job Job, result Result, runErr erro
 	return tx.Commit(ctx)
 }
 
-type limitedBuffer struct {
-	bytes.Buffer
-	limit int
-}
-
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	n := len(p)
-	room := b.limit - b.Len()
-	if room > 0 {
-		if room > len(p) {
-			room = len(p)
-		}
-		_, _ = b.Buffer.Write(p[:room])
-	}
-	return n, nil
-}
-
-func (w *Worker) RunDocker(ctx context.Context, job Job) (Result, error) {
+func (w *Worker) RunGoPlugin(ctx context.Context, job Job) (Result, error) {
 	var result Result
+	if _, failed := w.timedOut.Load(job.LibraryPath); failed {
+		return result, errors.New("plugin previously timed out; restart worker")
+	}
 	info, err := os.Stat(job.PackagePath)
 	if err != nil || !info.Mode().IsRegular() {
 		return result, errors.New("package file missing")
 	}
-	input := map[string]any{"protocol_version": "1", "job_id": job.ID, "submission_id": job.SubmissionID, "task_id": job.TaskID, "config": json.RawMessage(job.Config)}
-	encoded, err := json.Marshal(input)
-	if err != nil {
-		return result, err
+	type outcome struct {
+		result Result
+		err    error
 	}
-	args := []string{"run", "--rm", "-i", "--pull=never", "--network=none", "--read-only", "--pids-limit=64", "--memory=256m", "--cpus=1",
-		fmt.Sprintf("--user=%d:%d", os.Getuid(), os.Getgid()), "--security-opt=no-new-privileges", "--cap-drop=ALL",
-		"--mount", "type=bind,src=" + job.PackagePath + ",dst=/input/submission.zip,readonly", job.Image}
-	cmd := exec.CommandContext(ctx, "docker", args...)
-	cmd.Stdin = bytes.NewReader(encoded)
-	stdout := &limitedBuffer{limit: 65536}
-	stderr := &limitedBuffer{limit: 16384}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err = cmd.Run(); err != nil {
-		if ctx.Err() != nil {
-			return result, fmt.Errorf("plugin timed out: %w", ctx.Err())
+	done := make(chan outcome, 1)
+	go func() {
+		var out outcome
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				out = outcome{err: fmt.Errorf("plugin panic: %v", recovered)}
+			}
+			done <- out
+		}()
+		loaded, err := plugin.Open(job.LibraryPath)
+		if err != nil {
+			out.err = fmt.Errorf("load plugin: %w", err)
+			return
 		}
-		return result, fmt.Errorf("plugin exited: %v; %s", err, strings.TrimSpace(stderr.String()))
+		symbol, err := loaded.Lookup("Evaluate")
+		if err != nil {
+			out.err = fmt.Errorf("plugin Evaluate not found: %w", err)
+			return
+		}
+		evaluate, ok := symbol.(func(context.Context, pluginapi.Request) (pluginapi.Result, error))
+		if !ok {
+			out.err = errors.New("plugin Evaluate has wrong signature")
+			return
+		}
+		out.result, out.err = evaluate(ctx, pluginapi.Request{
+			ProtocolVersion: pluginapi.ProtocolVersion,
+			JobID:           job.ID,
+			SubmissionID:    job.SubmissionID,
+			TaskID:          job.TaskID,
+			SubmissionPath:  job.PackagePath,
+			Config:          job.Config,
+		})
+	}()
+	select {
+	case <-ctx.Done():
+		w.timedOut.Store(job.LibraryPath, true)
+		return result, fmt.Errorf("plugin timed out: %w", ctx.Err())
+	case out := <-done:
+		return out.result, out.err
 	}
-	if stdout.Len() >= stdout.limit {
-		return result, errors.New("plugin output too large")
-	}
-	text := strings.TrimSpace(stdout.String())
-	if strings.Contains(text, "\n") {
-		return result, errors.New("plugin must output one JSON line")
-	}
-	if err = json.Unmarshal([]byte(text), &result); err != nil {
-		return result, fmt.Errorf("invalid plugin JSON: %w", err)
-	}
-	return result, nil
 }

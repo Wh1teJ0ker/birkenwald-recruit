@@ -2,11 +2,23 @@ name: CI
 
 on:
   push:
+    branches:
+      - '**'
+    tags-ignore:
+      - 'v*'
   pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18.6-alpine
@@ -22,8 +34,11 @@ jobs:
           --health-timeout 2s
           --health-retries 20
     env:
+      CGO_ENABLED: "1"
+      GOOS: linux
+      GOARCH: amd64
+      GOTOOLCHAIN: local
       TEST_DATABASE_URL: postgres://birkenwald:birkenwald_test@127.0.0.1:5432/birkenwald_test?sslmode=disable
-      TEST_DOCKER_PLUGIN_IMAGE: birkenwald-example:0.1.0
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: actions/setup-go@v7.0.0
@@ -35,10 +50,21 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-      - name: Build example plugin
-        run: docker build -f plugins/example/Dockerfile -t "$TEST_DOCKER_PLUGIN_IMAGE" .
+      - name: Verify release version
+        run: ./scripts/check-version.sh
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l cmd internal pluginapi plugins)"
+      - name: Static analysis
+        run: go vet ./...
       - name: Go tests with race detector
         run: go test -race ./...
+      - name: Build Linux API, worker, and example plugin
+        run: |
+          mkdir -p /tmp/birkenwald-build
+          go build -trimpath -o /tmp/birkenwald-build/api-linux-amd64 ./cmd/api
+          go build -trimpath -o /tmp/birkenwald-build/worker-linux-amd64 ./cmd/worker
+          go build -buildmode=plugin -trimpath -o /tmp/birkenwald-build/example-linux-amd64.so ./plugins/example
+          test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
       - name: Frontend tests and build
         working-directory: frontend
         run: |

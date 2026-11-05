@@ -13,9 +13,11 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
+	"net/mail"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,7 +26,7 @@ import (
 	"golang.org/x/crypto/argon2"
 )
 
-//go:embed migrations/001_init.up.sql
+//go:embed migrations/001_init.up.sql migrations/002_email_verification.up.sql migrations/003_admin_controls.up.sql migrations/004_go_plugin.up.sql
 var migrations embed.FS
 
 const Version = "0.1.0"
@@ -38,6 +40,12 @@ type Config struct {
 	AdminPassword string
 	CookieSecure  bool
 	PluginTimeout time.Duration
+	SMTPHost      string
+	SMTPPort      int
+	SMTPUsername  string
+	SMTPPassword  string
+	SMTPFrom      string
+	EmailDevMode  bool
 }
 
 func LoadConfig() (Config, error) {
@@ -49,6 +57,11 @@ func LoadConfig() (Config, error) {
 		AdminEmail:    strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_EMAIL"))),
 		AdminPassword: os.Getenv("ADMIN_PASSWORD"),
 		CookieSecure:  os.Getenv("COOKIE_SECURE") == "true",
+		SMTPHost:      strings.TrimSpace(os.Getenv("SMTP_HOST")),
+		SMTPUsername:  os.Getenv("SMTP_USERNAME"),
+		SMTPPassword:  os.Getenv("SMTP_PASSWORD"),
+		SMTPFrom:      strings.TrimSpace(getenv("SMTP_FROM", os.Getenv("SMTP_USERNAME"))),
+		EmailDevMode:  os.Getenv("EMAIL_DEV_MODE") == "true",
 	}
 	if c.DatabaseURL == "" {
 		return c, errors.New("DATABASE_URL is required")
@@ -57,6 +70,16 @@ func LoadConfig() (Config, error) {
 	c.PluginTimeout, err = time.ParseDuration(getenv("PLUGIN_TIMEOUT", "45s"))
 	if err != nil || c.PluginTimeout <= 0 {
 		return c, errors.New("invalid PLUGIN_TIMEOUT")
+	}
+	c.SMTPPort, err = strconv.Atoi(getenv("SMTP_PORT", "587"))
+	if err != nil || c.SMTPPort < 1 || c.SMTPPort > 65535 {
+		return c, errors.New("invalid SMTP_PORT")
+	}
+	if c.SMTPFrom == "" {
+		c.SMTPFrom = "no-reply@birkenwald.local"
+	}
+	if _, err = mail.ParseAddress(c.SMTPFrom); err != nil {
+		return c, errors.New("invalid SMTP_FROM")
 	}
 	c.UploadDir, err = filepath.Abs(c.UploadDir)
 	if err != nil {
@@ -107,18 +130,30 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 		return err
 	}
 	var applied bool
-	if err = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = 1)").Scan(&applied); err != nil {
-		return err
-	}
-	if !applied {
-		sql, err := migrations.ReadFile("migrations/001_init.up.sql")
+	for _, migration := range []struct {
+		version int
+		file    string
+	}{
+		{1, "migrations/001_init.up.sql"},
+		{2, "migrations/002_email_verification.up.sql"},
+		{3, "migrations/003_admin_controls.up.sql"},
+		{4, "migrations/004_go_plugin.up.sql"},
+	} {
+		applied = false
+		if err = tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = $1)", migration.version).Scan(&applied); err != nil {
+			return err
+		}
+		if applied {
+			continue
+		}
+		sql, err := migrations.ReadFile(migration.file)
 		if err != nil {
 			return err
 		}
 		if _, err = tx.Exec(ctx, string(sql), pgx.QueryExecModeSimpleProtocol); err != nil {
-			return fmt.Errorf("migration 1: %w", err)
+			return fmt.Errorf("migration %d: %w", migration.version, err)
 		}
-		if _, err = tx.Exec(ctx, "INSERT INTO schema_migrations(version) VALUES (1)"); err != nil {
+		if _, err = tx.Exec(ctx, "INSERT INTO schema_migrations(version) VALUES ($1)", migration.version); err != nil {
 			return err
 		}
 	}
@@ -258,7 +293,7 @@ func SaveUpload(dir, kind string, header *multipart.FileHeader) (SavedFile, erro
 			return out, errors.New("resume must be a PDF")
 		}
 	} else {
-        if count < 4 || string(magic[:4]) != "PK\x03\x04" {
+		if count < 4 || string(magic[:4]) != "PK\x03\x04" {
 			return out, errors.New("package must be a ZIP")
 		}
 		if err := validateZIP(dst.Name()); err != nil {

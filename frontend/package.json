@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "antd": "6.7.0",
+    "dayjs": "^1.11.23",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },

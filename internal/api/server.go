@@ -3,9 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
-	"net/mail"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -15,7 +13,6 @@ import (
 
 	"github.com/Wh1teJ0ker/birkenwald-recruit/internal/platform"
 	"github.com/gin-gonic/gin"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -56,7 +53,9 @@ func (s *Server) Router() *gin.Engine {
 	}
 
 	api := r.Group("/api/v1")
+	api.GET("/config", s.publicConfig)
 	api.POST("/auth/register", s.register)
+	api.POST("/auth/verification-code", s.sendVerificationCode)
 	api.POST("/auth/login", s.login)
 	private := api.Group("")
 	private.Use(s.authenticate)
@@ -72,8 +71,19 @@ func (s *Server) Router() *gin.Engine {
 	admin := private.Group("/admin")
 	admin.Use(requireAdmin)
 	admin.GET("/plugins", s.listPlugins)
+	admin.POST("/plugins", s.createPlugin)
+	admin.POST("/plugins/upload", s.uploadPlugin)
+	admin.GET("/plugins/example/package", s.downloadExamplePluginPackage)
+	admin.GET("/plugins/example/binary", s.downloadExamplePluginBinary)
+	admin.PATCH("/plugins/:id", s.updatePlugin)
+	admin.GET("/users", s.adminUsers)
+	admin.PATCH("/users/:id", s.updateUser)
 	admin.POST("/campaigns", s.createCampaign)
+	admin.PATCH("/campaigns/:id", s.updateCampaign)
 	admin.POST("/tasks", s.createTask)
+	admin.PATCH("/tasks/:id", s.updateTask)
+	admin.GET("/settings", s.adminSettings)
+	admin.PATCH("/settings", s.updateSettings)
 	admin.GET("/submissions", s.adminSubmissions)
 	admin.POST("/evaluations/:id/retry", s.retryEvaluation)
 	return r
@@ -128,7 +138,7 @@ func (s *Server) authenticate(c *gin.Context) {
 	var u User
 	err = s.DB.QueryRow(c.Request.Context(), `SELECT u.id,u.email,u.display_name,u.role,s.csrf_token
         FROM sessions s JOIN users u ON u.id=s.user_id
-        WHERE s.token_hash=$1 AND s.expires_at>now()`, platform.TokenHash(token)).Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.CSRF)
+        WHERE s.token_hash=$1 AND s.expires_at>now() AND NOT u.disabled`, platform.TokenHash(token)).Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.CSRF)
 	if err != nil {
 		fail(c, 401, "session expired")
 		return
@@ -156,47 +166,6 @@ func requireAdmin(c *gin.Context) {
 type authInput struct {
 	Email    string `json:"email"`
 	Password string `json:"password"`
-	Name     string `json:"name"`
-}
-
-func (s *Server) register(c *gin.Context) {
-	if !sameOrigin(c) {
-		fail(c, 403, "invalid origin")
-		return
-	}
-	var in authInput
-	if err := c.ShouldBindJSON(&in); err != nil {
-		fail(c, 400, "invalid JSON")
-		return
-	}
-	in.Email = strings.ToLower(strings.TrimSpace(in.Email))
-	in.Name = strings.TrimSpace(in.Name)
-	addr, err := mail.ParseAddress(in.Email)
-	if err != nil || addr.Address != in.Email || len(in.Email) > 254 || len(in.Name) < 1 || len(in.Name) > 100 || len(in.Password) < 12 {
-		fail(c, 422, "valid email, name and password of at least 12 characters required")
-		return
-	}
-	hash, err := platform.HashPassword(in.Password)
-	if err != nil {
-		fail(c, 500, "registration failed")
-		return
-	}
-	var id int64
-	err = s.DB.QueryRow(c.Request.Context(), `INSERT INTO users(email,display_name,password_hash,role)
-        VALUES($1,$2,$3,'student') ON CONFLICT(email) DO NOTHING RETURNING id`, in.Email, in.Name, hash).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		fail(c, 409, "email already registered")
-		return
-	}
-	if err != nil {
-		fail(c, 500, "registration failed")
-		return
-	}
-	if err = s.setSession(c, id); err != nil {
-		fail(c, 500, "session failed")
-		return
-	}
-	c.JSON(201, gin.H{"id": id, "role": "student"})
 }
 
 func (s *Server) login(c *gin.Context) {
@@ -211,9 +180,14 @@ func (s *Server) login(c *gin.Context) {
 	}
 	var id int64
 	var hash, role string
-	err := s.DB.QueryRow(c.Request.Context(), "SELECT id,password_hash,role FROM users WHERE email=$1", strings.ToLower(strings.TrimSpace(in.Email))).Scan(&id, &hash, &role)
+	var disabled bool
+	err := s.DB.QueryRow(c.Request.Context(), "SELECT id,password_hash,role,disabled FROM users WHERE email=$1", strings.ToLower(strings.TrimSpace(in.Email))).Scan(&id, &hash, &role, &disabled)
 	if err != nil || !platform.CheckPassword(hash, in.Password) {
 		fail(c, 401, "invalid credentials")
+		return
+	}
+	if disabled {
+		fail(c, 403, "account disabled")
 		return
 	}
 	if err = s.setSession(c, id); err != nil {
@@ -367,7 +341,12 @@ func (s *Server) listTasks(c *gin.Context) {
 }
 
 func (s *Server) listPlugins(c *gin.Context) {
-	rows, err := s.DB.Query(c.Request.Context(), "SELECT id,name,version,image_ref,config_schema FROM plugin_versions WHERE enabled ORDER BY name,version")
+	query := "SELECT id,name,version,library_path,config_schema,enabled FROM plugin_versions"
+	if c.Query("all") != "true" {
+		query += " WHERE enabled"
+	}
+	query += " ORDER BY name,version"
+	rows, err := s.DB.Query(c.Request.Context(), query)
 	if err != nil {
 		fail(c, 500, "list plugins failed")
 		return
@@ -376,13 +355,18 @@ func (s *Server) listPlugins(c *gin.Context) {
 	items := make([]gin.H, 0)
 	for rows.Next() {
 		var id int64
-		var name, version, image string
+		var name, version, libraryPath string
 		var schema json.RawMessage
-		if err := rows.Scan(&id, &name, &version, &image, &schema); err != nil {
+		var enabled bool
+		if err := rows.Scan(&id, &name, &version, &libraryPath, &schema, &enabled); err != nil {
 			fail(c, 500, "list plugins failed")
 			return
 		}
-		items = append(items, gin.H{"id": id, "name": name, "version": version, "image_ref": image, "config_schema": schema})
+		items = append(items, gin.H{"id": id, "name": name, "version": version, "library_path": libraryPath, "config_schema": schema, "enabled": enabled})
+	}
+	if err := rows.Err(); err != nil {
+		fail(c, 500, "list plugins failed")
+		return
 	}
 	c.JSON(200, items)
 }
